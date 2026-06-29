@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import capture_error, trace_from_header
+from . import capture_error, capture_span, new_span_id, trace_from_header
+from . import _now_iso
 
 
 class OctriMiddleware:
-    """ASGI middleware that reports unhandled exceptions to Octri."""
+    """ASGI middleware: reports unhandled exceptions AND times each request as a
+    server span (a child of the client SDK span via ``traceparent``)."""
 
     def __init__(self, app: Any) -> None:
         self.app = app
@@ -30,17 +32,29 @@ class OctriMiddleware:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        trace = trace_from_header(headers.get("traceparent"))
+        span_id = new_span_id()
+        start = _now_iso()
+        status = {"code": 200}
+
+        async def _send(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                status["code"] = message.get("status", 200)
+            await send(message)
+
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, _send)
         except Exception as exc:
+            status["code"] = 500
             try:
-                headers = {
-                    key.decode("latin-1").lower(): value.decode("latin-1")
-                    for key, value in scope.get("headers", [])
-                }
                 capture_error(
                     exc,
-                    trace=trace_from_header(headers.get("traceparent")),
+                    trace=trace,
                     method=scope.get("method"),
                     path=scope.get("path"),
                     status_code=500,
@@ -49,3 +63,17 @@ class OctriMiddleware:
                 # Never let monitoring swallow or mask the originating error.
                 pass
             raise
+        finally:
+            try:
+                capture_span(
+                    trace_id=trace.trace_id,
+                    span_id=span_id,
+                    parent_span_id=trace.parent_span_id,
+                    name=f"{scope.get('method', '')} {scope.get('path', '')}".strip(),
+                    service="server",
+                    start_time=start,
+                    end_time=_now_iso(),
+                    status="error" if status["code"] >= 500 else "ok",
+                )
+            except Exception:
+                pass

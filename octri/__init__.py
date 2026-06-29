@@ -24,7 +24,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib import request as _urlrequest
 
-__all__ = ["init", "capture_error", "trace_from_header", "TraceContext", "OctriConfig"]
+__all__ = [
+    "init",
+    "capture_error",
+    "capture_span",
+    "new_span_id",
+    "trace_from_header",
+    "TraceContext",
+    "OctriConfig",
+]
 
 _CONTEXT_LINES = 5
 _TRACEPARENT_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$", re.IGNORECASE)
@@ -58,6 +66,15 @@ def init(url: str, token: str, environment: str, release: Optional[str] = None) 
 
 def _hex(nbytes: int) -> str:
     return secrets.token_hex(nbytes)
+
+
+def new_span_id() -> str:
+    """A fresh 64-bit span id (16 hex chars), for a span this service produces."""
+    return _hex(8)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ── Trace context (W3C) ──────────────────────────────────────────────────────
@@ -186,15 +203,51 @@ def capture_error(
     # Drop unset fields so the wire shape matches @octri/node (undefined omitted).
     payload = {key: value for key, value in payload.items() if value is not None}
 
-    _send(cfg, payload)
+    _post_json(cfg, "/ingest", payload)
 
 
-def _send(cfg: OctriConfig, payload: Dict[str, Any]) -> None:
+def capture_span(
+    *,
+    trace_id: str,
+    span_id: str,
+    name: str,
+    parent_span_id: Optional[str] = None,
+    service: str = "server",
+    operation_id: Optional[str] = None,
+    start_time: str,
+    end_time: Optional[str] = None,
+    status: str = "ok",
+) -> None:
+    """Report one span to the monitoring trace store (fire-and-forget).
+
+    Spans sharing a ``trace_id`` form the request waterfall — the client SDK span
+    (root) and this server span (its child via ``parent_span_id``) line up under
+    one trace in the dashboard.
+    """
+    cfg = _config
+    if cfg is None:
+        return
+    payload: Dict[str, Any] = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "parentSpanId": parent_span_id,
+        "name": name,
+        "service": service,
+        "operationId": operation_id,
+        "startTime": start_time,
+        "endTime": end_time,
+        "status": status,
+    }
+    payload = {key: value for key, value in payload.items() if value is not None}
+    _post_json(cfg, "/traces", payload)
+
+
+def _post_json(cfg: OctriConfig, path: str, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload).encode("utf-8")
 
     def _post() -> None:
         req = _urlrequest.Request(
-            f"{cfg.url}/ingest",
+            f"{cfg.url}{path}",
             data=body,
             headers={"content-type": "application/json", "authorization": f"Bearer {cfg.token}"},
             method="POST",
@@ -202,7 +255,7 @@ def _send(cfg: OctriConfig, payload: Dict[str, Any]) -> None:
         try:
             _urlrequest.urlopen(req, timeout=5).close()  # noqa: S310 (trusted, configured URL)
         except Exception:
-            # A logging failure must never mask the originating error.
+            # A reporting failure must never mask the originating error.
             pass
 
     threading.Thread(target=_post, daemon=True).start()
