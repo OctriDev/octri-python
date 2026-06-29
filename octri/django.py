@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from . import capture_error, capture_span, new_span_id, trace_from_header
-from . import _now_iso
+from . import _now_iso, _set_current_span, _reset_current_span
 
 
 class OctriMiddleware:
@@ -31,7 +31,12 @@ class OctriMiddleware:
         start = _now_iso()
         span_id = new_span_id()
         trace = trace_from_header(request.headers.get("traceparent"))
-        response = self.get_response(request)
+        # Make this the active span so sub-spans nest under it (same thread).
+        token = _set_current_span(trace.trace_id, span_id)
+        try:
+            response = self.get_response(request)
+        finally:
+            _reset_current_span(token)
         try:
             status_code = getattr(response, "status_code", 200)
             capture_span(

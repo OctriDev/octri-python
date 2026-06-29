@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from . import capture_error, capture_span, new_span_id, trace_from_header
-from . import _now_iso
+from . import _now_iso, _set_current_span, _reset_current_span
 
 
 def octri_flask(app: Any) -> None:
@@ -24,13 +24,15 @@ def octri_flask(app: Any) -> None:
     from flask import g, got_request_exception, request
 
     def _start() -> None:
-        g._octri_span = {
-            "start": _now_iso(),
-            "span_id": new_span_id(),
-            "trace": trace_from_header(request.headers.get("traceparent")),
-        }
+        trace = trace_from_header(request.headers.get("traceparent"))
+        span_id = new_span_id()
+        g._octri_span = {"start": _now_iso(), "span_id": span_id, "trace": trace}
+        # Make this the active span so sub-spans (octri.span / start_span) nest
+        # under it for the duration of the request (same thread).
+        g._octri_token = _set_current_span(trace.trace_id, span_id)
 
     def _finish(exc: Optional[BaseException]) -> None:
+        _reset_current_span(getattr(g, "_octri_token", None))
         span = getattr(g, "_octri_span", None)
         if span is None:
             return

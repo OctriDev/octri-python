@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import capture_error, capture_span, new_span_id, trace_from_header
-from . import _now_iso
+from . import _now_iso, _set_current_span, _reset_current_span
 
 
 class OctriMiddleware:
@@ -41,6 +41,8 @@ class OctriMiddleware:
         span_id = new_span_id()
         start = _now_iso()
         status = {"code": 200}
+        # Make this the active span so sub-spans nest under it within this task.
+        token = _set_current_span(trace.trace_id, span_id)
 
         async def _send(message: Any) -> None:
             if message.get("type") == "http.response.start":
@@ -64,6 +66,7 @@ class OctriMiddleware:
                 pass
             raise
         finally:
+            _reset_current_span(token)
             try:
                 capture_span(
                     trace_id=trace.trace_id,

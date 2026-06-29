@@ -14,20 +14,24 @@ Then mount the integration for your framework (``octri.flask`` / ``octri.fastapi
 
 from __future__ import annotations
 
+import contextvars
 import json
 import linecache
 import re
 import secrets
 import threading
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 from urllib import request as _urlrequest
 
 __all__ = [
     "init",
     "capture_error",
     "capture_span",
+    "start_span",
+    "span",
     "new_span_id",
     "trace_from_header",
     "TraceContext",
@@ -240,6 +244,110 @@ def capture_span(
     }
     payload = {key: value for key, value in payload.items() if value is not None}
     _post_json(cfg, "/traces", payload)
+
+
+# ── Sub-spans (where time goes inside a request) ─────────────────────────────
+# The active span for the running request, propagated through the request's
+# thread / async task so a `start_span` / `span()` call nests under it (and under
+# any enclosing sub-span). The framework integration sets it per request.
+
+_current_span: "contextvars.ContextVar[Optional[Dict[str, str]]]" = contextvars.ContextVar(
+    "octri_current_span", default=None
+)
+
+
+def _set_current_span(trace_id: str, span_id: str) -> Any:
+    return _current_span.set({"trace_id": trace_id, "span_id": span_id})
+
+
+def _reset_current_span(token: Any) -> None:
+    if token is None:
+        return
+    try:
+        _current_span.reset(token)
+    except Exception:
+        pass
+
+
+class _NoopSpan:
+    def end(self, status: str = "ok") -> None:  # noqa: D401 - matches _SpanHandle
+        pass
+
+
+class _SpanHandle:
+    def __init__(
+        self, trace_id: str, span_id: str, parent_span_id: str, name: str, service: str, start: str
+    ) -> None:
+        self._trace_id = trace_id
+        self._span_id = span_id
+        self._parent_span_id = parent_span_id
+        self._name = name
+        self._service = service
+        self._start = start
+        self._ended = False
+
+    def end(self, status: str = "ok") -> None:
+        if self._ended:
+            return
+        self._ended = True
+        capture_span(
+            trace_id=self._trace_id,
+            span_id=self._span_id,
+            parent_span_id=self._parent_span_id,
+            name=self._name,
+            service=self._service,
+            start_time=self._start,
+            end_time=_now_iso(),
+            status=status,
+        )
+
+
+def start_span(name: str, op: Optional[str] = None) -> Any:
+    """Open a sub-span under the active request span; call ``.end()`` when done.
+
+    Returns a no-op handle outside a request or before ``init()``. ``op`` is a
+    category for color-coding the waterfall, e.g. "db", "cache", "http".
+    """
+    ctx = _current_span.get()
+    if _config is None or ctx is None:
+        return _NoopSpan()
+    return _SpanHandle(
+        ctx["trace_id"], new_span_id(), ctx["span_id"], name, op or "server", _now_iso()
+    )
+
+
+@contextmanager
+def span(name: str, op: Optional[str] = None) -> Iterator[None]:
+    """Time a block as a sub-span under the active request span. Nests correctly.
+
+        with octri.span("orders.list", op="db"):
+            rows = db.query(sql)
+    """
+    ctx = _current_span.get()
+    if _config is None or ctx is None:
+        yield
+        return
+    span_id = new_span_id()
+    start = _now_iso()
+    token = _current_span.set({"trace_id": ctx["trace_id"], "span_id": span_id})
+    status = "ok"
+    try:
+        yield
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _reset_current_span(token)
+        capture_span(
+            trace_id=ctx["trace_id"],
+            span_id=span_id,
+            parent_span_id=ctx["span_id"],
+            name=name,
+            service=op or "server",
+            start_time=start,
+            end_time=_now_iso(),
+            status=status,
+        )
 
 
 def _post_json(cfg: OctriConfig, path: str, payload: Dict[str, Any]) -> None:
