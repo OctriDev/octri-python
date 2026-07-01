@@ -240,6 +240,7 @@ def capture_span(
         "traceId": trace_id,
         "spanId": span_id,
         "parentSpanId": parent_span_id,
+        "environment": cfg.environment,
         "name": name,
         "service": service,
         "operationId": operation_id,
