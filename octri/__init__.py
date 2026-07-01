@@ -15,6 +15,8 @@ Then mount the integration for your framework (``octri.flask`` / ``octri.fastapi
 from __future__ import annotations
 
 import contextvars
+import functools
+import inspect
 import json
 import linecache
 import re
@@ -23,7 +25,7 @@ import threading
 import traceback
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib import request as _urlrequest
 
 __all__ = [
@@ -32,6 +34,9 @@ __all__ = [
     "capture_span",
     "start_span",
     "span",
+    "instrument",
+    "traced",
+    "auto_instrument",
     "new_span_id",
     "trace_from_header",
     "TraceContext",
@@ -270,7 +275,7 @@ def _reset_current_span(token: Any) -> None:
 
 
 class _NoopSpan:
-    def end(self, status: str = "ok") -> None:  # noqa: D401 - matches _SpanHandle
+    def finish(self, status: str = "ok") -> None:  # noqa: D401 - matches _SpanHandle
         pass
 
 
@@ -286,7 +291,7 @@ class _SpanHandle:
         self._start = start
         self._ended = False
 
-    def end(self, status: str = "ok") -> None:
+    def finish(self, status: str = "ok") -> None:
         if self._ended:
             return
         self._ended = True
@@ -303,7 +308,7 @@ class _SpanHandle:
 
 
 def start_span(name: str, op: Optional[str] = None) -> Any:
-    """Open a sub-span under the active request span; call ``.end()`` when done.
+    """Open a sub-span under the active request span; call ``.finish()`` when done.
 
     Returns a no-op handle outside a request or before ``init()``. ``op`` is a
     category for color-coding the waterfall, e.g. "db", "cache", "http".
@@ -348,6 +353,174 @@ def span(name: str, op: Optional[str] = None) -> Iterator[None]:
             end_time=_now_iso(),
             status=status,
         )
+
+
+# ── Automatic instrumentation ────────────────────────────────────────────────
+
+
+def _trace_call(name: str, op: Optional[str], func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
+    """Run a sync callable as a sub-span under the active request span."""
+    ctx = _current_span.get()
+    if _config is None or ctx is None:
+        return func(*args, **kwargs)
+    span_id = new_span_id()
+    start = _now_iso()
+    token = _current_span.set({"trace_id": ctx["trace_id"], "span_id": span_id})
+    status = "ok"
+    try:
+        return func(*args, **kwargs)
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _reset_current_span(token)
+        capture_span(
+            trace_id=ctx["trace_id"], span_id=span_id, parent_span_id=ctx["span_id"],
+            name=name, service=op or "server", start_time=start, end_time=_now_iso(), status=status
+        )
+
+
+async def _trace_call_async(name: str, op: Optional[str], func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
+    """Run an async callable as a sub-span under the active request span."""
+    ctx = _current_span.get()
+    if _config is None or ctx is None:
+        return await func(*args, **kwargs)
+    span_id = new_span_id()
+    start = _now_iso()
+    token = _current_span.set({"trace_id": ctx["trace_id"], "span_id": span_id})
+    status = "ok"
+    try:
+        return await func(*args, **kwargs)
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _reset_current_span(token)
+        capture_span(
+            trace_id=ctx["trace_id"], span_id=span_id, parent_span_id=ctx["span_id"],
+            name=name, service=op or "server", start_time=start, end_time=_now_iso(), status=status
+        )
+
+
+def _wrap(func: Callable[..., Any], op: Optional[str], name_for: Callable[[tuple], str]) -> Callable[..., Any]:
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def awrapper(*args: Any, **kwargs: Any) -> Any:
+            return await _trace_call_async(name_for(args), op, func, args, kwargs)
+
+        return awrapper
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _trace_call(name_for(args), op, func, args, kwargs)
+
+    return wrapper
+
+
+def instrument(
+    target: Any,
+    methods: List[str],
+    op: Optional[str] = None,
+    name: Optional[Callable[[str, tuple], str]] = None,
+) -> Any:
+    """Wrap the named methods of an object/class so every call becomes a sub-span.
+
+    Point it at a DB client, cache, or util module once and all calls are traced
+    without per-call code::
+
+        octri.instrument(cursor, ["execute"], op="db")
+        octri.instrument(cache, ["get", "set"], op="cache")
+    """
+    for method in methods:
+        orig = getattr(target, method, None)
+        if not callable(orig):
+            continue
+        if name is not None:
+            name_for = (lambda m: (lambda args: name(m, args)))(method)  # noqa: E731
+        else:
+            name_for = (lambda m: (lambda _args: m))(method)  # noqa: E731
+        setattr(target, method, _wrap(orig, op, name_for))
+    return target
+
+
+def traced(op: Optional[str] = None, name: Optional[str] = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator: trace each call to a function as a sub-span.
+
+        @octri.traced(op="db")
+        def load_orders(user_id): ...
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        label = name or getattr(func, "__name__", "fn")
+        return _wrap(func, op, lambda _args: label)
+
+    return decorator
+
+
+def _is_monitoring_url(url: Any) -> bool:
+    return _config is not None and isinstance(url, str) and url.startswith(_config.url)
+
+
+def _host_path(url: Any) -> str:
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(url))
+        return f"{parsed.netloc}{parsed.path}"
+    except Exception:
+        return str(url)
+
+
+def auto_instrument(http: bool = True) -> None:
+    """Turn on zero-config tracing for common I/O.
+
+    ``http`` instruments the ``requests`` library and ``urllib`` so every outbound
+    HTTP call becomes a span. Calls to your monitoring backend are never traced
+    (no feedback loop). For your own DB client or util modules, use ``instrument``.
+    """
+    if http:
+        _patch_requests()
+        _patch_urllib()
+
+
+def _patch_requests() -> None:
+    try:
+        import requests  # type: ignore
+    except Exception:
+        return
+    session = requests.Session
+    if getattr(session, "_octri_patched", False):
+        return
+    orig = session.request
+
+    @functools.wraps(orig)
+    def wrapper(self: Any, method: Any, url: Any, *args: Any, **kwargs: Any) -> Any:
+        if _is_monitoring_url(url) or _current_span.get() is None:
+            return orig(self, method, url, *args, **kwargs)
+        name = f"{str(method).upper()} {_host_path(url)}"
+        return _trace_call(name, "http", orig, (self, method, url, *args), kwargs)
+
+    session.request = wrapper  # type: ignore[method-assign]
+    session._octri_patched = True  # type: ignore[attr-defined]
+
+
+def _patch_urllib() -> None:
+    if getattr(_urlrequest, "_octri_patched", False):
+        return
+    orig = _urlrequest.urlopen
+
+    @functools.wraps(orig)
+    def wrapper(url: Any, *args: Any, **kwargs: Any) -> Any:
+        target = url.full_url if hasattr(url, "full_url") else url
+        if _is_monitoring_url(target) or _current_span.get() is None:
+            return orig(url, *args, **kwargs)
+        method = url.get_method() if hasattr(url, "get_method") else "GET"
+        name = f"{method} {_host_path(target)}"
+        return _trace_call(name, "http", orig, (url, *args), kwargs)
+
+    _urlrequest.urlopen = wrapper  # type: ignore[assignment]
+    _urlrequest._octri_patched = True  # type: ignore[attr-defined]
 
 
 def _post_json(cfg: OctriConfig, path: str, payload: Dict[str, Any]) -> None:

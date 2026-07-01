@@ -61,6 +61,39 @@ trace in the dashboard.
 For compiled/minified clients, the dashboard pairs this with source maps / source
 bundles; the Python server frames already carry their original source inline.
 
+## Spans & the request waterfall
+
+The middleware times each request. To see where time goes inside it, let Octri
+instrument common I/O automatically, or open spans yourself.
+
+### Automatic
+
+```python
+octri.auto_instrument()                       # traces requests + urllib (outbound HTTP)
+octri.instrument(cursor, ["execute"], op="db")  # your own DB client / util module, once
+octri.instrument(cache, ["get", "set"], op="cache")
+
+@octri.traced(op="fn")
+def compute_totals(orders): ...
+```
+
+Every instrumented call (and every outbound HTTP request) becomes a sub-span
+under the current request — no per-call code. Calls to your monitoring backend
+are never traced (no feedback loop).
+
+### Manual
+
+```python
+with octri.span("orders.list", op="db"):
+    rows = db.query(sql)
+
+s = octri.start_span("render", op="view")
+# ...work...
+s.finish()
+```
+
+`op` ("db", "cache", "http", …) colour-codes the bar in the dashboard waterfall.
+
 ## Manual capture
 
 ```python
