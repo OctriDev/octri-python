@@ -30,6 +30,7 @@ from urllib import request as _urlrequest
 
 __all__ = [
     "init",
+    "capture_event",
     "capture_error",
     "capture_span",
     "start_span",
@@ -44,13 +45,15 @@ __all__ = [
 ]
 
 _CONTEXT_LINES = 5
+_REQUEST_TIMEOUT_SECONDS = 5
+_MAX_IDEMPOTENCY_KEY_LENGTH = 256
 _TRACEPARENT_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$", re.IGNORECASE)
 
 
 class OctriConfig:
     """Resolved reporter configuration."""
 
-    def __init__(self, url: str, token: str, environment: str, release: Optional[str] = None) -> None:
+    def __init__(self, url: str, token: Optional[str], environment: str, release: Optional[str] = None) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.environment = environment
@@ -60,12 +63,12 @@ class OctriConfig:
 _config: Optional[OctriConfig] = None
 
 
-def init(url: str, token: str, environment: str, release: Optional[str] = None) -> None:
+def init(url: str, token: Optional[str], environment: str, release: Optional[str] = None) -> None:
     """Configure the reporter. Call once at startup before mounting middleware.
 
     Args:
         url: Monitoring base URL, e.g. ``https://monitoring.example.com``.
-        token: Ingest token for your project (the same one your SDK uses).
+        token: Project ingest token, or ``None`` for an open self-hosted endpoint.
         environment: Project environment / id (the dashboard project id).
         release: Optional release identifier reported with each error.
     """
@@ -86,6 +89,42 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _all_zeros(value: str) -> bool:
+    return bool(value) and all(char == "0" for char in value)
+
+
+def _safe_header_value(value: Any) -> bool:
+    return isinstance(value, str) and value != "" and "\r" not in value and "\n" not in value
+
+
+def _safe_idempotency_key(value: Any) -> bool:
+    if not _safe_header_value(value):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= _MAX_IDEMPOTENCY_KEY_LENGTH
+    except UnicodeEncodeError:
+        return False
+
+
+def _resolve_event_id(value: Any) -> str:
+    candidate = value.strip() if isinstance(value, str) else ""
+    return candidate if _safe_idempotency_key(candidate) else _hex(16)
+
+
+def _non_blank(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_timestamp(value: Any) -> bool:
+    if not _non_blank(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 # ── Trace context (W3C) ──────────────────────────────────────────────────────
 
 
@@ -102,8 +141,10 @@ def trace_from_header(traceparent: Optional[str]) -> TraceContext:
     """Read the trace from a ``traceparent`` header, or start a fresh trace."""
     if traceparent:
         match = _TRACEPARENT_RE.match(traceparent.strip())
-        if match:
-            return TraceContext(trace_id=match.group(1), parent_span_id=match.group(2))
+        if match and not _all_zeros(match.group(1)) and not _all_zeros(match.group(2)):
+            return TraceContext(
+                trace_id=match.group(1).lower(), parent_span_id=match.group(2).lower()
+            )
     return TraceContext(trace_id=_hex(16))
 
 
@@ -167,6 +208,70 @@ def _build_frames(exc: BaseException) -> List[Dict[str, Any]]:
 # ── Reporting ────────────────────────────────────────────────────────────────
 
 
+def capture_event(
+    message: str,
+    *,
+    level: str = "info",
+    timestamp: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    method: Optional[str] = None,
+    path: Optional[str] = None,
+    status_code: Optional[int] = None,
+    latency_ms: Optional[float] = None,
+    attempt: Optional[int] = None,
+    request_id: Optional[str] = None,
+    user: Optional[Dict[str, Any]] = None,
+    tags: Optional[Dict[str, Any]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    breadcrumbs: Optional[List[Dict[str, Any]]] = None,
+    fingerprint: Optional[str] = None,
+    trace: Optional[TraceContext] = None,
+    span_id: Optional[str] = None,
+    event_id: Optional[str] = None,
+) -> None:
+    """Log a standalone application event (fire-and-forget).
+
+    This API does not depend on a generated Octri client SDK. ``event_id`` may
+    be supplied to make a retried delivery idempotent.
+    """
+    cfg = _config
+    if cfg is None:
+        return
+    try:
+        resolved_event_id = _resolve_event_id(event_id)
+        payload: Dict[str, Any] = {
+            "eventId": resolved_event_id,
+            "timestamp": timestamp or _now_iso(),
+            "level": level,
+            "message": message,
+            "operationId": operation_id,
+            "method": method,
+            "path": path,
+            "statusCode": status_code,
+            "latencyMs": latency_ms,
+            "attempt": attempt,
+            "requestId": request_id,
+            "environment": cfg.environment,
+            "release": cfg.release,
+            "user": user,
+            "tags": {"octri.origin": "standalone", **(tags or {})},
+            "context": context,
+            "breadcrumbs": breadcrumbs,
+            "fingerprint": fingerprint,
+            "traceId": trace.trace_id if trace else None,
+            "spanId": span_id,
+        }
+        _post_json(
+            cfg,
+            "/ingest",
+            {key: value for key, value in payload.items() if value is not None},
+            resolved_event_id,
+        )
+    except Exception:
+        # Invalid caller data must never affect the host application.
+        pass
+
+
 def capture_error(
     error: BaseException,
     *,
@@ -186,33 +291,38 @@ def capture_error(
     if cfg is None:
         return
 
-    tc = trace or TraceContext(trace_id=_hex(16))
-    stack = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    try:
+        tc = trace or TraceContext(trace_id=_hex(16))
+        stack = "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
-    payload: Dict[str, Any] = {
-        "eventId": _hex(16),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "level": level,
-        "method": method,
-        "path": path,
-        "operationId": operation_id,
-        "statusCode": status_code,
-        "environment": cfg.environment,
-        "release": cfg.release,
-        "traceId": tc.trace_id,
-        "spanId": _hex(8),
-        "tags": {"octri.origin": "server"},
-        "error": {
-            "name": type(error).__name__,
-            "message": str(error),
-            "stack": stack,
-            "frames": _build_frames(error),
-        },
-    }
-    # Drop unset fields so the wire shape matches @octri/node (undefined omitted).
-    payload = {key: value for key, value in payload.items() if value is not None}
+        event_id = _hex(16)
+        payload: Dict[str, Any] = {
+            "eventId": event_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": level,
+            "method": method,
+            "path": path,
+            "operationId": operation_id,
+            "statusCode": status_code,
+            "environment": cfg.environment,
+            "release": cfg.release,
+            "traceId": tc.trace_id,
+            "spanId": _hex(8),
+            "tags": {"octri.origin": "server"},
+            "error": {
+                "name": type(error).__name__,
+                "message": str(error),
+                "stack": stack,
+                "frames": _build_frames(error),
+            },
+        }
+        # Drop unset fields so the wire shape matches @octri/node (undefined omitted).
+        payload = {key: value for key, value in payload.items() if value is not None}
 
-    _post_json(cfg, "/ingest", payload)
+        _post_json(cfg, "/ingest", payload, event_id)
+    except Exception:
+        # Invalid exception-like objects must not affect the host application.
+        pass
 
 
 def capture_span(
@@ -236,6 +346,16 @@ def capture_span(
     cfg = _config
     if cfg is None:
         return
+    if (
+        not _non_blank(trace_id)
+        or not _non_blank(span_id)
+        or not _non_blank(name)
+        or not _valid_timestamp(start_time)
+        or (end_time is not None and not _valid_timestamp(end_time))
+        or (len(trace_id) == 32 and _all_zeros(trace_id))
+        or (len(span_id) == 16 and _all_zeros(span_id))
+    ):
+        return
     payload: Dict[str, Any] = {
         "traceId": trace_id,
         "spanId": span_id,
@@ -249,7 +369,7 @@ def capture_span(
         "status": status,
     }
     payload = {key: value for key, value in payload.items() if value is not None}
-    _post_json(cfg, "/traces", payload)
+    _post_json(cfg, "/traces", payload, f"{trace_id}:{span_id}")
 
 
 # ── Sub-spans (where time goes inside a request) ─────────────────────────────
@@ -524,20 +644,31 @@ def _patch_urllib() -> None:
     _urlrequest._octri_patched = True  # type: ignore[attr-defined]
 
 
-def _post_json(cfg: OctriConfig, path: str, payload: Dict[str, Any]) -> None:
-    body = json.dumps(payload).encode("utf-8")
+def _post_json(cfg: OctriConfig, path: str, payload: Dict[str, Any], idempotency_key: str) -> None:
+    if not _safe_idempotency_key(idempotency_key):
+        return
+    if cfg.token is not None and cfg.token != "" and not _safe_header_value(cfg.token):
+        return
 
     def _post() -> None:
-        req = _urlrequest.Request(
-            f"{cfg.url}{path}",
-            data=body,
-            headers={"content-type": "application/json", "authorization": f"Bearer {cfg.token}"},
-            method="POST",
-        )
         try:
-            _urlrequest.urlopen(req, timeout=5).close()  # noqa: S310 (trusted, configured URL)
+            body = json.dumps(payload).encode("utf-8")
+            headers = {"content-type": "application/json", "idempotency-key": idempotency_key}
+            if cfg.token:
+                headers["authorization"] = f"Bearer {cfg.token}"
+            req = _urlrequest.Request(
+                f"{cfg.url}{path}",
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            _urlrequest.urlopen(req, timeout=_REQUEST_TIMEOUT_SECONDS).close()  # noqa: S310
         except Exception:
             # A reporting failure must never mask the originating error.
             pass
 
-    threading.Thread(target=_post, daemon=True).start()
+    try:
+        threading.Thread(target=_post, daemon=True).start()
+    except Exception:
+        # Thread exhaustion must not make monitoring affect the application.
+        pass

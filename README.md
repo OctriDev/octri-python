@@ -22,6 +22,29 @@ init(
 )
 ```
 
+Hosted users can copy the project-scoped URL, token, and environment from the
+Monitoring connection settings (or its API). Pass `token=None` only when
+pointing at an open self-hosted ingest endpoint. Every request carries an
+idempotency key.
+
+## Standalone events
+
+No generated API SDK is required to send your own events:
+
+```python
+from octri import capture_event
+
+capture_event(
+    "checkout.completed",
+    user={"id": customer.id},
+    tags={"region": "eu-west", "plan": "growth"},
+    context={"order_id": order.id, "total": order.total},
+)
+```
+
+Delivery is best-effort and happens off the calling thread. Pass `event_id` to
+make a retried delivery idempotent.
+
 ### Flask
 
 ```python
