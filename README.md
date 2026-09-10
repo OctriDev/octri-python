@@ -4,7 +4,7 @@
 Flask, FastAPI, or Django with original-source context per stack frame, time
 every request into a waterfall, and join each server error to the client SDK
 error for the same request through the W3C `traceparent` header. In the
-dashboard you see the full client → server stack under one trace.
+dashboard you see the full client and server stack under one trace.
 
 Octri turns an OpenAPI spec into a documentation site, client SDKs for ten
 languages, an MCP server your AI assistant can call, and monitoring for the
@@ -78,7 +78,7 @@ app.add_middleware(OctriMiddleware)   # reports unhandled 500s, then re-raises
 ### Django
 
 ```python
-# settings.py — after calling init(...) somewhere at startup
+# settings.py, after calling init(...) somewhere at startup
 MIDDLEWARE = [
     # ...
     "octri.django.OctriMiddleware",
@@ -90,7 +90,7 @@ MIDDLEWARE = [
 The Octri client SDK sends a `traceparent` header on every request. Each
 integration reads it, captures the failing exception (with source context for
 each in-app frame), and reports it tagged `octri.origin=server` under the same
-`traceId` — so the client SDK error and this server error appear as one linked
+`traceId`, so the client SDK error and this server error appear as one linked
 trace in the dashboard.
 
 For compiled/minified clients, the dashboard pairs this with source maps / source
@@ -113,7 +113,7 @@ def compute_totals(orders): ...
 ```
 
 Every instrumented call (and every outbound HTTP request) becomes a sub-span
-under the current request — no per-call code. Calls to your monitoring backend
+under the current request, with no per-call code. Calls to your monitoring backend
 are never traced (no feedback loop).
 
 ### Manual
@@ -127,7 +127,7 @@ s = octri.start_span("render", op="view")
 s.finish()
 ```
 
-`op` ("db", "cache", "http", …) colour-codes the bar in the dashboard waterfall.
+`op` ("db", "cache", "http", and so on) color-codes the bar in the dashboard waterfall.
 
 ## Manual capture
 
@@ -154,19 +154,21 @@ except Exception as exc:
 
 ### Monitoring runtimes
 
-[Node](https://github.com/octridev/octri-node) ·
-[Python](https://github.com/octridev/octri-python) ·
-[Go](https://github.com/octridev/octri-go) ·
-[Ruby](https://github.com/octridev/octri-ruby) ·
-[Rust](https://github.com/octridev/octri-rust) ·
-[PHP](https://github.com/octridev/octri-php) ·
-[Java](https://github.com/octridev/octri-java) ·
-[Kotlin](https://github.com/octridev/octri-kotlin) ·
-[Swift](https://github.com/octridev/octri-swift) ·
-[Dart](https://github.com/octridev/octri-dart)
+- [Node](https://github.com/octridev/octri-node)
+- [Python](https://github.com/octridev/octri-python)
+- [Go](https://github.com/octridev/octri-go)
+- [Ruby](https://github.com/octridev/octri-ruby)
+- [Rust](https://github.com/octridev/octri-rust)
+- [PHP](https://github.com/octridev/octri-php)
+- [Java](https://github.com/octridev/octri-java)
+- [Kotlin](https://github.com/octridev/octri-kotlin)
+- [Swift](https://github.com/octridev/octri-swift)
+- [Dart](https://github.com/octridev/octri-dart)
 
-[Documentation](https://docs.octri.dev/docs) ·
-[Pricing](https://octri.dev/pricing) ·
-[Changelog](https://docs.octri.dev/changelog)
+### More
+
+- [Documentation](https://docs.octri.dev/docs)
+- [Pricing](https://octri.dev/pricing)
+- [Changelog](https://docs.octri.dev/changelog)
 
 MIT licensed.
