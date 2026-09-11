@@ -1,8 +1,8 @@
-"""@octri/python — server-side error monitoring for Python backends.
+"""@octri/python: server-side error monitoring for Python backends.
 
 Add it to your live API; it reports backend errors to your Octri monitoring
 project (with original-source context per stack frame) and links each one to the
-client SDK error for the same request via the W3C ``traceparent`` header — so the
+client SDK error for the same request via the W3C ``traceparent`` header, so the
 dashboard shows the full client -> server stack under one trace.
 
     from octri import init
@@ -19,6 +19,7 @@ import functools
 import inspect
 import json
 import linecache
+import os
 import re
 import secrets
 import threading
@@ -40,11 +41,15 @@ __all__ = [
     "auto_instrument",
     "new_span_id",
     "trace_from_header",
+    "add_scrub_fields",
+    "set_before_send",
     "TraceContext",
     "OctriConfig",
 ]
 
 _CONTEXT_LINES = 5
+_MAX_SOURCE_BYTES = 512 * 1024
+_MAX_CACHED_SOURCES = 256
 _REQUEST_TIMEOUT_SECONDS = 5
 _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 _TRACEPARENT_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$", re.IGNORECASE)
@@ -125,6 +130,163 @@ def _valid_timestamp(value: Any) -> bool:
         return False
 
 
+# ── Scrubbing ────────────────────────────────────────────────────────────────
+
+# Keys whose value never leaves the process. Compared against the key with case
+# and separators removed, so `api_key`, `apiKey` and `API-KEY` all match
+# `apikey`, and the test is a substring one, so `stripe_secret_key` matches too.
+_SCRUB_KEYS = (
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "apikey",
+    "authorization",
+    "credential",
+    "cookie",
+    "session",
+    "privatekey",
+    "accesskey",
+    "cardnumber",
+    "creditcard",
+    "cvv",
+    "ssn",
+)
+
+_REDACTED = "[redacted]"
+_TRUNCATED = "[truncated]"
+_CIRCULAR = "[circular]"
+# Deep enough for real context objects, shallow enough to stay cheap.
+_MAX_SCRUB_DEPTH = 8
+
+_BEARER_RE = re.compile(r"\bbearer\s+[\w.~+/-]+=*", re.IGNORECASE)
+_JWT_RE = re.compile(r"\beyJ[\w-]+\.[\w-]+\.[\w-]+")
+_DIGIT_RUN_RE = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
+_EMAIL_RE = re.compile(r"[\w.%+-]+@[\w-]+(?:\.[\w-]+)+")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
+
+_extra_scrub_keys: List[str] = []
+_before_send: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None
+
+
+def add_scrub_fields(*fields: str) -> None:
+    """Redact more key names, on top of the built-in list.
+
+    Matching ignores case and separators and is a substring test, so `account`
+    also covers `account_number`::
+
+        octri.add_scrub_fields("account_number", "otp")
+    """
+    for field in fields:
+        key = _normalize_key(field)
+        if key and key not in _extra_scrub_keys:
+            _extra_scrub_keys.append(key)
+
+
+def set_before_send(
+    hook: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
+) -> None:
+    """Run a hook on every payload just before it is sent.
+
+    Return the payload (editing it in place is fine) to send it, or ``None`` to
+    drop the event::
+
+        octri.set_before_send(lambda payload: None if payload["path"] == "/health" else payload)
+
+    Redaction still runs afterwards, so a hook cannot leak a credential by
+    accident. Pass ``None`` to remove the hook.
+    """
+    global _before_send
+    _before_send = hook
+
+
+def _normalize_key(key: Any) -> str:
+    if not isinstance(key, str):
+        return ""
+    return _NON_ALNUM_RE.sub("", key.lower())
+
+
+def _is_secret_key(key: Any) -> bool:
+    normalized = _normalize_key(key)
+    if not normalized:
+        return False
+    return any(candidate in normalized for candidate in _SCRUB_KEYS) or any(
+        candidate in normalized for candidate in _extra_scrub_keys
+    )
+
+
+def _passes_luhn(digits: str) -> bool:
+    """Tell a card number from the order ids and timestamps that look like one."""
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        digit = ord(char) - 48
+        if index % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def _scrub_digit_run(match: "re.Match[str]") -> str:
+    run = match.group(0)
+    return _REDACTED if _passes_luhn(run.replace(" ", "").replace("-", "")) else run
+
+
+def _scrub_text(value: str) -> str:
+    """Remove credentials and personal data that leaked into free text."""
+    if not value:
+        return value
+    value = _BEARER_RE.sub(_REDACTED, value)
+    value = _JWT_RE.sub(_REDACTED, value)
+    value = _DIGIT_RUN_RE.sub(_scrub_digit_run, value)
+    return _EMAIL_RE.sub(_REDACTED, value)
+
+
+def _scrub_value(value: Any, depth: int, text: bool, seen: set) -> Any:
+    """Redact credential-shaped keys anywhere in the payload, and strip secrets
+    out of the free text around them.
+
+    ``user`` is the field you deliberately fill with an identity, so its strings
+    are left alone; its keys are still checked.
+    """
+    if isinstance(value, str):
+        return _scrub_text(value) if text else value
+    if not isinstance(value, (dict, list, tuple)):
+        return value
+    if depth >= _MAX_SCRUB_DEPTH:
+        return _TRUNCATED
+    # Walking a copy means a cycle would recurse forever, and a context object
+    # holding a reference back to itself is common enough to be worth surviving.
+    if id(value) in seen:
+        return _CIRCULAR
+    seen.add(id(value))
+    try:
+        if isinstance(value, (list, tuple)):
+            return [_scrub_value(item, depth + 1, text, seen) for item in value]
+        return {
+            key: _REDACTED
+            if _is_secret_key(key)
+            else _scrub_value(nested, depth + 1, text and key != "user", seen)
+            for key, nested in value.items()
+        }
+    finally:
+        seen.discard(id(value))
+
+
+def _scrub_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The last thing every payload passes through.
+
+    Both the hook and the redaction live here rather than in the capture
+    functions, so nothing can be reported around them.
+    """
+    hooked = payload if _before_send is None else _before_send(payload)
+    if not isinstance(hooked, dict):
+        return None
+    return _scrub_value(hooked, 0, True, set())
+
+
 # ── Trace context (W3C) ──────────────────────────────────────────────────────
 
 
@@ -161,6 +323,20 @@ def _in_app(filename: str) -> bool:
     )
 
 
+def _source_is_readable(filename: str) -> bool:
+    """Big files are skipped, not truncated, so line numbers keep lining up."""
+    try:
+        return os.path.getsize(filename) <= _MAX_SOURCE_BYTES
+    except OSError:
+        return False
+
+
+def _trim_source_cache() -> None:
+    # linecache keeps whole files; a traceback can name any number of them.
+    if len(linecache.cache) > _MAX_CACHED_SOURCES:
+        linecache.clearcache()
+
+
 def _build_frames(exc: BaseException) -> List[Dict[str, Any]]:
     """Walks an exception's traceback into structured frames with source context."""
     frames: List[Dict[str, Any]] = []
@@ -177,9 +353,13 @@ def _build_frames(exc: BaseException) -> List[Dict[str, Any]]:
             "inApp": _in_app(filename),
         }
 
-        # Original source around the failing line (works for files on disk).
-        linecache.checkcache(filename)
-        context_line = linecache.getline(filename, lineno)
+        # Original source around the failing line, for your own files only:
+        # the dashboard shows them, site-packages source is noise.
+        context_line = ""
+        if frame["inApp"] and _source_is_readable(filename):
+            _trim_source_cache()
+            linecache.checkcache(filename)
+            context_line = linecache.getline(filename, lineno)
         if context_line:
             frame["contextLine"] = context_line.rstrip("\n")
             pre = [
@@ -339,7 +519,7 @@ def capture_span(
 ) -> None:
     """Report one span to the monitoring trace store (fire-and-forget).
 
-    Spans sharing a ``trace_id`` form the request waterfall — the client SDK span
+    Spans sharing a ``trace_id`` form the request waterfall: the client SDK span
     (root) and this server span (its child via ``parent_span_id``) line up under
     one trace in the dashboard.
     """
@@ -649,10 +829,13 @@ def _post_json(cfg: OctriConfig, path: str, payload: Dict[str, Any], idempotency
         return
     if cfg.token is not None and cfg.token != "" and not _safe_header_value(cfg.token):
         return
+    scrubbed = _scrub_payload(payload)
+    if scrubbed is None:
+        return
 
     def _post() -> None:
         try:
-            body = json.dumps(payload).encode("utf-8")
+            body = json.dumps(scrubbed).encode("utf-8")
             headers = {"content-type": "application/json", "idempotency-key": idempotency_key}
             if cfg.token:
                 headers["authorization"] = f"Bearer {cfg.token}"

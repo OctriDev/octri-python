@@ -79,6 +79,15 @@ class StandaloneEventTest(unittest.TestCase):
         finally:
             octri._post_json = original
 
+    def test_source_context_is_limited_to_in_app_frames(self) -> None:
+        try:
+            json.loads("{")
+        except ValueError as error:
+            frames = octri._build_frames(error)
+
+        self.assertTrue(any(f["inApp"] and f.get("contextLine") for f in frames))
+        self.assertFalse(any(not f["inApp"] and f.get("contextLine") for f in frames))
+
     def test_invalid_spans_and_unsafe_auth_are_suppressed(self) -> None:
         captured = []
         original_post = octri._post_json
