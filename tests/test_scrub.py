@@ -114,15 +114,34 @@ class ScrubTest(unittest.TestCase):
 
     # ── The user field ────────────────────────────────────────────────────────
 
-    def test_user_identity_survives_but_user_credentials_do_not(self) -> None:
+    # The identity the dashboard keys on is "id", which survives. Direct
+    # identifiers under the user are redacted like they are in every generated SDK.
+    def test_user_id_survives_but_user_credentials_and_identifiers_do_not(self) -> None:
         body = self.capture(
             "profile update failed",
-            user={"id": "u_1", "email": "ada@example.com", "session_token": "st_1"},
+            user={"id": "u_1", "email": "ada@example.com", "session_token": "st_1", "customerPhone": "+1 555 0100"},
         )
 
-        self.assertEqual(body["user"]["email"], "ada@example.com")
         self.assertEqual(body["user"]["id"], "u_1")
+        self.assertEqual(body["user"]["email"], "[redacted]")
         self.assertEqual(body["user"]["session_token"], "[redacted]")
+        self.assertEqual(body["user"]["customerPhone"], "[redacted]")
+
+    def test_identifier_words_inside_longer_keys_are_redacted(self) -> None:
+        body = self.capture(
+            "checkout failed",
+            context={
+                "billingAddress": {"line1": "1 High St"},
+                "shipping_first_name": "Ada",
+                "avatarUrl": "https://cdn.example.com/a.png",
+                "queryTimeMs": 12,
+            },
+        )
+
+        self.assertEqual(body["context"]["billingAddress"], "[redacted]")
+        self.assertEqual(body["context"]["shipping_first_name"], "[redacted]")
+        self.assertEqual(body["context"]["avatarUrl"], "https://cdn.example.com/a.png")
+        self.assertEqual(body["context"]["queryTimeMs"], 12)
 
     # ── before_send ───────────────────────────────────────────────────────────
 
